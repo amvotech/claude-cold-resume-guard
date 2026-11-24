@@ -61,26 +61,24 @@ Keepwarm daemons send background prompts every 4 minutes. A 100k-token session p
 
 ### 1. via Homebrew (Recommended for Mac developers)
 ```bash
-brew tap amvotech/tap
-brew install claude-cold-resume-guard
+brew install l2cache-app/tap/cold-resume-guard && cold-resume-guard --setup
 ```
 *Installs `cold-resume-guard`, `claude-guard`, and `codex-guard`.*
 
 ### 2. Quick 1-Line Curl Installer (Zero setup)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/amvotech/claude-cold-resume-guard/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/l2cache-app/claude-cold-resume-guard/main/install.sh | bash
 ```
 
 ### 3. via pip / pipx (Python developers)
 ```bash
 pip install claude-cold-resume-guard
-# or run directly without installing:
-pipx run claude-cold-resume-guard
+cold-resume-guard --setup
 ```
 
 ### 4. Git Clone
 ```bash
-git clone https://github.com/amvotech/claude-cold-resume-guard.git
+git clone https://github.com/l2cache-app/claude-cold-resume-guard.git
 cd claude-cold-resume-guard
 python3 guard.py
 ```
