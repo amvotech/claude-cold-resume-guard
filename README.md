@@ -56,13 +56,43 @@ python3 guard.py
 
 ---
 
+## CLI Usage & Commands
+
+```bash
+# Guard the latest session in the current directory before launching
+cold-resume-guard
+
+# Guard a specific session before resuming
+cold-resume-guard --resume e539a748
+# or shorthand:
+cold-resume-guard e539a748
+
+# List recent sessions in current project with cache status & token counts
+cold-resume-guard --list
+
+# Report-only mode (prints metrics without blocking)
+cold-resume-guard --check-only
+```
+
+---
+
 ## How to Hook into Claude Code
 
-Add this alias to your `~/.zshrc` or `~/.bashrc`:
+Add this function to your `~/.zshrc` or `~/.bashrc`:
+
 ```bash
-alias claude="cold-resume-guard && claude"
+claude() {
+    cold-resume-guard "$@" && command claude "$@"
+}
 ```
-Whenever you launch Claude Code or return to a session, the guard runs instantaneously in `<5ms`. If your cache is warm, it stays completely silent. If your session is expired and large, it warns you before you hit Return.
+
+Then reload:
+```bash
+source ~/.zshrc
+```
+
+### Why a shell function?
+Using a function ensures that when you run `claude --resume <id>`, the session ID is passed into `cold-resume-guard` first. The guard inspects the exact session you are resuming, warns you if its prompt cache has expired, and halts before your quota is burned. If the cache is warm (<60 min), Claude opens instantly with zero prompt.
 
 ---
 
