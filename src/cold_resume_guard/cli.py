@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+"""
+Cold-Resume Guard for Claude Code & Codex CLI.
+"""
 import sys
 import os
 import json
