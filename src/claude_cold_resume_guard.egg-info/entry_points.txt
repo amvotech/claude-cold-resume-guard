@@ -1,0 +1,4 @@
+[console_scripts]
+claude-guard = cold_resume_guard.cli:main
+codex-guard = cold_resume_guard.cli:main
+cold-resume-guard = cold_resume_guard.cli:main

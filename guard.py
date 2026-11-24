@@ -279,6 +279,28 @@ codex() {
         print(f"\033[1;31mError updating shell config: {e}\033[0m")
         sys.exit(1)
 
+def copy_to_clipboard(text):
+    import subprocess
+    try:
+        proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE, close_fds=True)
+        proc.communicate(text.encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+def generate_handoff_prompt(project_name, meta):
+    branch_info = f" on branch '{meta['branch']}'" if meta.get("branch") else ""
+    title = meta.get("title") or "Previous session"
+    last_prompt = meta.get("last_prompt") or ""
+    
+    parts = [f"Resuming work on {project_name}{branch_info}."]
+    if title and not title.startswith("Untitled"):
+        parts.append(f"Previous goal: \"{title}\".")
+    if last_prompt:
+        parts.append(f"Last context: \"{last_prompt}\".")
+    parts.append("Please continue with clean context from where we left off.")
+    return " ".join(parts)
+
 def extract_forward_args(argv):
     forward = []
     i = 0
@@ -455,10 +477,23 @@ Options:
             try:
                 choice = input(f"\n\033[1;31mProceed into cold {meta['agent']} session anyway? [y/N]: \033[0m").strip().lower()
                 if choice not in ("y", "yes"):
-                    print("\033[1;32m✓ Launch blocked.\033[0m Run fresh session or use L2Cache handoff.\n")
+                    handoff = generate_handoff_prompt(project_name, meta)
+                    copied = copy_to_clipboard(handoff)
+                    print("\n\033[1;32m✓ Launch blocked.\033[0m")
+                    if copied:
+                        print("\033[1;36m📋 Fresh handoff prompt copied to your clipboard!\033[0m")
+                        print(f"Run a fresh session (\033[1m{meta['agent'].split()[0].lower()}\033[0m) and press \033[1m⌘V\033[0m to continue at ~3k tokens.")
+                    else:
+                        print(f"\033[1mHandoff prompt:\033[0m \"{handoff}\"")
+                    print("\033[90mBuilt with ❤️ by L2Cache — Native developer memory & MCP server for Mac: https://l2cache.app\033[0m\n")
                     sys.exit(1)
             except (KeyboardInterrupt, EOFError):
-                print("\n\033[1;32m✓ Launch cancelled.\033[0m\n")
+                handoff = generate_handoff_prompt(project_name, meta)
+                copied = copy_to_clipboard(handoff)
+                print("\n\033[1;32m✓ Launch cancelled.\033[0m")
+                if copied:
+                    print("\033[1;36m📋 Fresh handoff prompt copied to your clipboard!\033[0m")
+                print("\033[90mBuilt with ❤️ by L2Cache — Native developer memory & MCP server for Mac: https://l2cache.app\033[0m\n")
                 sys.exit(1)
         print()
     elif not check_only:
