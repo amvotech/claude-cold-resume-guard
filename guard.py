@@ -423,6 +423,15 @@ Options:
     ttl = ttl_override or (CODEX_TTL if agent_type == "codex" else CLAUDE_PRO_TTL)
     is_cold = idle_seconds > ttl
     
+    # Ensure shorthand session IDs are normalized to resume syntax for underlying agent
+    if session_query:
+        if agent_type == "codex":
+            if "resume" not in forward_args:
+                forward_args = ["resume", meta["session_id"]] + [a for a in forward_args if a != session_query]
+        else:
+            if not any(a in ("--resume", "-r") for a in forward_args):
+                forward_args = ["--resume", meta["full_id"]] + [a for a in forward_args if a != session_query]
+    
     if is_cold and tokens > 20000:
         penalty_tokens = int(tokens * CACHE_WRITE_MULTIPLIER)
         pct_of_quota = round((penalty_tokens / 2500000) * 100, 1)
