@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-cold-resume-guard"
-version = "0.1.0"
+version = "0.1.6"
 description = "Prevent cold-cache token spikes and quota exhaustion in Claude Code & Codex CLI"
 readme = "README.md"
 authors = [{ name = "Amvotech", email = "support@amvo.store" }]
@@ -21,6 +21,7 @@ classifiers = [
 [project.scripts]
 cold-resume-guard = "cold_resume_guard.cli:main"
 claude-guard = "cold_resume_guard.cli:main"
+codex-guard = "cold_resume_guard.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

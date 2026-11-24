@@ -58,41 +58,74 @@ python3 guard.py
 
 ## CLI Usage & Commands
 
+You can use `cold-resume-guard` **immediately without configuring any shell aliases or functions**:
+
+### Direct Usage (No Configuration Required)
 ```bash
-# Guard the latest session in the current directory before launching
+# Guard the latest Claude session in current directory, then launch Claude
 cold-resume-guard
 
-# Guard a specific session before resuming
+# Guard a specific Claude session before resuming
 cold-resume-guard --resume e539a748
 # or shorthand:
 cold-resume-guard e539a748
 
-# List recent sessions in current project with cache status & token counts
+# Guard the latest OpenAI Codex session, then launch Codex
+codex-guard
+# or:
+cold-resume-guard --agent codex
+
+# Guard a specific Codex session before resuming
+codex-guard resume 01a1f7e5
+# or:
+cold-resume-guard resume 01a1f7e5
+
+# List recent Claude & Codex sessions in project with cache status & token counts
 cold-resume-guard --list
 
-# Report-only mode (prints metrics without blocking)
+# Report-only mode (prints metrics without blocking or launching)
 cold-resume-guard --check-only
 ```
 
 ---
 
-## How to Hook into Claude Code
+## Zero-Friction Setup: Replace `claude` and `codex` Commands
 
-Add this function to your `~/.zshrc` or `~/.bashrc`:
+If you want `claude` and `codex` in your terminal to automatically be guarded without having to remember to type `cold-resume-guard`:
 
+### Option A: Automatic 1-Command Setup
+Run:
+```bash
+cold-resume-guard --setup
+```
+This safely detects your shell (`~/.zshrc` or `~/.bashrc`) and adds the transparent function wrappers:
 ```bash
 claude() {
-    cold-resume-guard "$@" && command claude "$@"
+    cold-resume-guard "$@"
+}
+codex() {
+    cold-resume-guard --agent codex "$@"
 }
 ```
+Then reload your terminal: `source ~/.zshrc`.
 
-Then reload:
-```bash
-source ~/.zshrc
-```
+### Option B: Manual Setup
+Add the snippet above to your `~/.zshrc` or `~/.bashrc` manually.
 
-### Why a shell function?
-Using a function ensures that when you run `claude --resume <id>`, the session ID is passed into `cold-resume-guard` first. The guard inspects the exact session you are resuming, warns you if its prompt cache has expired, and halts before your quota is burned. If the cache is warm (<60 min), Claude opens instantly with zero prompt.
+### Why a shell function instead of an alias?
+In POSIX shells, an alias like `alias claude="cold-resume-guard && claude"` drops arguments passed to the first command, so running `claude --resume <id>` would leave `cold-resume-guard` without the session ID. Using a shell function forwards all arguments (`--resume <id>`, `resume <id>`, prompts, and flags) to `cold-resume-guard`. The guard checks the exact session on disk, warns you if cold, and once confirmed (or if warm), launches `claude` or `codex` directly via process execution (`os.execvp`).
+
+---
+
+## OpenAI Codex CLI Support
+
+OpenAI Codex CLI has a **10-minute (600s) prompt cache TTL** (compared to 60 minutes for Claude Pro). Sessions go cold 6× faster!
+
+`cold-resume-guard` includes built-in support for Codex:
+- **Session Discovery:** Scans `~/.codex/sessions/**/rollout-*.jsonl` matching your project's working directory (`cwd`).
+- **Context Inspection:** Computes the active turn context (`input_tokens`) and warns before sending cold turns over the network.
+- **Handoff Suggestion:** Recommends typing `/new` inside Codex to begin a fresh turn with an L2Cache context summary (~3k tokens) instead of burning ~150k+ tokens on a cold resume.
+- **Command Syntax:** Seamlessly supports `codex resume <id>`, `codex resume --last`, and `codex <prompt>`.
 
 ---
 
