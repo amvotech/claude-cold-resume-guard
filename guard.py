@@ -41,7 +41,7 @@ def inspect_session(session_file):
     last_event_time = session_file.stat().st_mtime
     idle_seconds = time.time() - last_event_time
     
-    estimated_tokens = 0
+    active_tokens = 0
     message_count = 0
     
     try:
@@ -52,22 +52,29 @@ def inspect_session(session_file):
                 try:
                     data = json.loads(line)
                     message_count += 1
-                    # Extract token counts if available
-                    usage = data.get("usage", {})
-                    if "input_tokens" in usage:
-                        estimated_tokens = max(estimated_tokens, usage.get("input_tokens", 0))
-                    elif "tokens" in data:
-                        estimated_tokens = max(estimated_tokens, data.get("tokens", 0))
+                    
+                    msg = data.get("message", {})
+                    usage = msg.get("usage") if isinstance(msg, dict) else None
+                    if not usage and "usage" in data:
+                        usage = data["usage"]
+                        
+                    if usage and isinstance(usage, dict):
+                        total_turn_tokens = (
+                            usage.get("cache_read_input_tokens", 0) +
+                            usage.get("cache_creation_input_tokens", 0) +
+                            usage.get("input_tokens", 0)
+                        )
+                        if total_turn_tokens > 0:
+                            active_tokens = total_turn_tokens
                 except json.JSONDecodeError:
                     continue
     except Exception:
         pass
     
-    # Fallback to file size heuristic if token field is unpopulated (~3.5 chars per token)
-    if estimated_tokens == 0:
-        estimated_tokens = int(session_file.stat().st_size / 3.5)
+    if active_tokens == 0:
+        active_tokens = min(int(session_file.stat().st_size / 4.0), 200000)
         
-    return idle_seconds, estimated_tokens, message_count
+    return idle_seconds, active_tokens, message_count
 
 def main():
     import argparse
