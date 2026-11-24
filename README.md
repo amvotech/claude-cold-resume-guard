@@ -19,7 +19,7 @@ A single message sent into a cold 140,000-token conversation burns **~175,000 we
 • Last Prompt: "i checked google . it says This site is currently moving"
 • Last Active: 24.9h ago · (TTL is 60m)
 • Accumulated Context: ~303,598 tokens (1337 events)
-• Cold Reload Penalty: ~379,497 weighted input tokens (~15.2% of quota)
+• Cold Reload Penalty: ~379,497 weighted input tokens (~15.2% of 5h quota · ~1.9% of weekly)
 
 Options: Type /clear inside Claude Code for fresh handoff (~3k tokens).
 

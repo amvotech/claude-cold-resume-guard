@@ -486,7 +486,8 @@ Options:
     
     if is_cold and tokens > 20000:
         penalty_tokens = int(tokens * CACHE_WRITE_MULTIPLIER)
-        pct_of_quota = round((penalty_tokens / 2500000) * 100, 1)
+        pct_of_5h = round((penalty_tokens / 2500000) * 100, 1)
+        pct_of_weekly = round((penalty_tokens / 20000000) * 100, 1)
         
         project_name = os.path.basename(os.getcwd())
         time_display = f"{idle_hours}h ago ({meta['last_active']})" if idle_minutes >= 60 else f"{idle_minutes}m ago"
@@ -500,7 +501,7 @@ Options:
             print(f"• \033[1mLast Prompt:\033[0m \"{prompt_preview}\"")
         print(f"• \033[1mLast Active:\033[0m {time_display} · \033[90m(TTL is {ttl // 60}m)\033[0m")
         print(f"• \033[1mAccumulated Context:\033[0m ~{tokens:,} tokens ({messages} events)")
-        print(f"• \033[1;31mCold Reload Penalty:\033[0m ~{penalty_tokens:,} weighted input tokens \033[1;31m(~{pct_of_quota}% of quota)\033[0m")
+        print(f"• \033[1;31mCold Reload Penalty:\033[0m ~{penalty_tokens:,} weighted input tokens \033[1;31m(~{pct_of_5h}% of 5h quota · ~{pct_of_weekly}% of weekly)\033[0m")
         print(f"\n\033[1mOptions:\033[0m Type \033[1;36m{meta['handoff_cmd']}\033[0m inside {meta['agent']} for fresh handoff (~3k tokens).")
         
         if not check_only:
