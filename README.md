@@ -1,24 +1,54 @@
 # cold-resume-guard
 
-> Prevent cold-cache token spikes and quota exhaustion in **Claude Code** and **Codex CLI**.
+> Prevent cold-cache token spikes and quota exhaustion in **Claude Code** and **OpenAI Codex CLI**.
 
-When an AI coding session sits idle past its prompt cache TTL (60 minutes on Claude Pro/Team subscriptions, 5 minutes on API keys), the model's KV-cache expires. Resuming that session forces a complete cache write across the accumulated context at **1.25× base input pricing**.
+When an AI coding session sits idle past its prompt cache TTL (60 minutes on Claude Pro/Team subscriptions, 10 minutes on Codex CLI, 5 minutes on direct API keys), the model's KV-cache expires. Resuming that session forces a complete cache write across the accumulated context at **1.25× base input pricing**.
 
-A single message sent into a cold 140,000-token conversation can burn **~175,000 weighted tokens** (~5%–7% of your 5-hour quota and ~1%–2% of your weekly allowance).
+A single message sent into a cold 140,000-token conversation burns **~175,000 weighted tokens** (~5%–7% of your 5-hour quota and ~1%–2% of your entire weekly allowance).
 
-`cold-resume-guard` is a lightweight terminal helper that inspects local session transcripts deterministically on disk (`~/.claude/projects/` and `~/.codex/sessions/`), computes the cache expiration status, and warns you before you transmit a cold rewrite.
+`cold-resume-guard` is a lightweight terminal helper that inspects local session transcripts deterministically on disk (`~/.claude/projects/` and `~/.codex/sessions/`), computes cache expiration status, warns you before you transmit a cold rewrite, and **automatically copies an enriched context handoff to your clipboard** if you choose to start fresh.
+
+---
+
+## What It Looks Like in Your Terminal
+
+```text
+⚠️  [Claude Code Guard] Prompt Cache Expired
+• Session: L2Cache cache rewrite attribution (id: e539a748)
+• Context: Project: L2Cache | Branch: main
+• Last Prompt: "i checked google . it says This site is currently moving"
+• Last Active: 24.9h ago · (TTL is 60m)
+• Accumulated Context: ~303,598 tokens (1337 events)
+• Cold Reload Penalty: ~379,497 weighted input tokens (~15.2% of quota)
+
+Options: Type /clear inside Claude Code for fresh handoff (~3k tokens).
+
+Proceed into cold Claude Code session anyway? [y/N]: N
+
+✓ Launch blocked.
+📋 Rich handoff prompt copied to your clipboard:
+   Resuming work on L2Cache [Branch: main | Session: e539a748]:
+   • Goal: L2Cache cache rewrite attribution
+   • Last Context: "i checked google . it says This site is currently moving"
+   • Last Commit: d66c96c feat(cache): warn when a proxy may be breaking the prompt cache
+   • Modified Files: L2cache.xcodeproj/project.pbxproj, tasks/todo.md (+14 more)
+   Please inspect the current git state and continue work from where we left off.
+
+Run a fresh session (claude) and press ⌘V to continue at ~3k tokens.
+Built with ❤️ by L2Cache — Native developer memory & MCP server for Mac: https://l2cache.app
+```
 
 ---
 
 ## The Math: Cold Resume vs Context Handoff
 
-| Metric | Raw Cold Resume | With Guard + `/clear` Handoff |
+| Metric | Raw Cold Resume | With Guard + Clipboard Handoff |
 |---|---|---|
-| **Context Evaluated** | 140,000 tokens | ~3,000 tokens |
+| **Context Evaluated** | 140,000 tokens | ~75 tokens |
 | **Pricing Tier** | 1.25× (Cache Write) | 1.0× (Standard Input) |
-| **Effective Tokens Charged** | **~175,000 tokens** | **~3,000 tokens** |
-| **Quota Consumption** | 5%–7% of 5-hr limit | <0.1% |
-| **Token Reduction** | Baseline (0%) | **~98% Reduction** |
+| **Effective Tokens Charged** | **~175,000 tokens** | **<100 tokens** |
+| **Quota Consumption** | 5%–7% of 5-hr limit | <0.01% |
+| **Token Reduction** | Baseline (0%) | **~99.9% Reduction** |
 
 ### Why Not Keepwarm Pings?
 Keepwarm daemons send background prompts every 4 minutes. A 100k-token session pinged 15 times/hour burns **36,000,000 tokens per day** while you are away or sleeping. 
@@ -29,22 +59,23 @@ Keepwarm daemons send background prompts every 4 minutes. A 100k-token session p
 
 ## Installation Options
 
-### 1. via pip / pipx (Recommended for Python devs)
-```bash
-pip install claude-cold-resume-guard
-# or run without installing
-pipx run claude-cold-resume-guard
-```
-
-### 2. via Homebrew (Mac developers)
+### 1. via Homebrew (Recommended for Mac developers)
 ```bash
 brew tap amvotech/tap
 brew install claude-cold-resume-guard
 ```
+*Installs `cold-resume-guard`, `claude-guard`, and `codex-guard`.*
 
-### 3. Quick 1-Line Curl Installer (Zero setup)
+### 2. Quick 1-Line Curl Installer (Zero setup)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/amvotech/claude-cold-resume-guard/main/install.sh | bash
+```
+
+### 3. via pip / pipx (Python developers)
+```bash
+pip install claude-cold-resume-guard
+# or run directly without installing:
+pipx run claude-cold-resume-guard
 ```
 
 ### 4. Git Clone
@@ -117,14 +148,25 @@ In POSIX shells, an alias like `alias claude="cold-resume-guard && claude"` drop
 
 ---
 
+## Automatic Smart Handoff (New in v0.1.9)
+
+When you press `[N]` to block a cold resume, `cold-resume-guard` doesn't just stop the launch—it solves the context problem on the spot:
+
+1. **Gathers Live Git State:** Inspects `git status -s` and `git log -1` to identify uncommitted modified files, your active branch, and the last commit checkpoint.
+2. **Synthesizes Intent:** Extracts your session goal and the exact last message you sent before leaving.
+3. **Copies to Clipboard:** Uses native macOS `pbcopy` to place a structured handoff prompt on your clipboard.
+4. **Zero-Friction Continuation:** Simply run `claude` or `codex`, press `⌘V`, and your agent resumes work with clean, warm context for **under 100 tokens**.
+
+---
+
 ## OpenAI Codex CLI Support
 
 OpenAI Codex CLI has a **10-minute (600s) prompt cache TTL** (compared to 60 minutes for Claude Pro). Sessions go cold 6× faster!
 
 `cold-resume-guard` includes built-in support for Codex:
 - **Session Discovery:** Scans `~/.codex/sessions/**/rollout-*.jsonl` matching your project's working directory (`cwd`).
-- **Context Inspection:** Computes the active turn context (`input_tokens`) and warns before sending cold turns over the network.
-- **Handoff Suggestion:** Recommends typing `/new` inside Codex to begin a fresh turn with an L2Cache context summary (~3k tokens) instead of burning ~150k+ tokens on a cold resume.
+- **Context Inspection:** Computes the active turn context (`last_token_usage.input_tokens`) and warns before sending cold turns over the network.
+- **Handoff Suggestion:** Recommends typing `/new` inside Codex to begin a fresh turn with clean context instead of burning ~150k+ tokens on a cold resume.
 - **Command Syntax:** Seamlessly supports `codex resume <id>`, `codex resume --last`, and `codex <prompt>`.
 
 ---
