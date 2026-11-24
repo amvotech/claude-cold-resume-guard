@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: claude-cold-resume-guard
-Version: 0.1.6
+Version: 0.1.8
 Summary: Prevent cold-cache token spikes and quota exhaustion in Claude Code & Codex CLI
 Author-email: Amvotech <support@amvo.store>
 License: MIT

@@ -289,17 +289,47 @@ def copy_to_clipboard(text):
         return False
 
 def generate_handoff_prompt(project_name, meta):
-    branch_info = f" on branch '{meta['branch']}'" if meta.get("branch") else ""
-    title = meta.get("title") or "Previous session"
+    branch = meta.get("branch") or "main"
+    title = meta.get("title") or ""
     last_prompt = meta.get("last_prompt") or ""
+    session_id = meta.get("session_id") or ""
     
-    parts = [f"Resuming work on {project_name}{branch_info}."]
+    modified_files = []
+    last_commit = ""
+    try:
+        import subprocess
+        status = subprocess.check_output(["git", "status", "-s"], text=True, stderr=subprocess.DEVNULL)
+        for line in status.strip().split("\n"):
+            if line.strip():
+                parts = line.strip().split(maxsplit=1)
+                if len(parts) == 2:
+                    modified_files.append(parts[1])
+    except Exception:
+        pass
+
+    try:
+        import subprocess
+        last_commit = subprocess.check_output(["git", "log", "-1", "--oneline"], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        pass
+
+    lines = [
+        f"Resuming work on {project_name} [Branch: {branch} | Session: {session_id}]:",
+    ]
     if title and not title.startswith("Untitled"):
-        parts.append(f"Previous goal: \"{title}\".")
+        lines.append(f"• Goal: {title}")
     if last_prompt:
-        parts.append(f"Last context: \"{last_prompt}\".")
-    parts.append("Please continue with clean context from where we left off.")
-    return " ".join(parts)
+        clean_prompt = last_prompt.strip().replace('"', "'")
+        lines.append(f"• Last Context: \"{clean_prompt}\"")
+    if last_commit:
+        lines.append(f"• Last Commit: {last_commit}")
+    if modified_files:
+        files_str = ", ".join(modified_files[:4])
+        if len(modified_files) > 4:
+            files_str += f" (+{len(modified_files) - 4} more)"
+        lines.append(f"• Modified Files: {files_str}")
+    lines.append("Please inspect the current git state and continue work from where we left off.")
+    return "\n".join(lines)
 
 def extract_forward_args(argv):
     forward = []
@@ -481,10 +511,11 @@ Options:
                     copied = copy_to_clipboard(handoff)
                     print("\n\033[1;32m✓ Launch blocked.\033[0m")
                     if copied:
-                        print("\033[1;36m📋 Fresh handoff prompt copied to your clipboard!\033[0m")
+                        print("\033[1;36m📋 Rich handoff prompt copied to your clipboard:\033[0m")
+                        print("\033[90m" + "\n".join("   " + line for line in handoff.split("\n")) + "\033[0m\n")
                         print(f"Run a fresh session (\033[1m{meta['agent'].split()[0].lower()}\033[0m) and press \033[1m⌘V\033[0m to continue at ~3k tokens.")
                     else:
-                        print(f"\033[1mHandoff prompt:\033[0m \"{handoff}\"")
+                        print(f"\033[1mHandoff prompt:\033[0m\n{handoff}\n")
                     print("\033[90mBuilt with ❤️ by L2Cache — Native developer memory & MCP server for Mac: https://l2cache.app\033[0m\n")
                     sys.exit(1)
             except (KeyboardInterrupt, EOFError):
