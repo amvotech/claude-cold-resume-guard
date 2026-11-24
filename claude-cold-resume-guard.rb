@@ -7,7 +7,7 @@ class ClaudeColdResumeGuard < Formula
   depends_on "python@3.11"
 
   def install
-    bin.install "tools/cold-resume-guard/guard.py" => "cold-resume-guard"
+    bin.install "guard.py" => "cold-resume-guard"
     bin.install_symlink bin/"cold-resume-guard" => "claude-guard"
   end
 
