@@ -27,9 +27,14 @@ def get_latest_claude_session(project_dir=None):
     return max(jsonl_files, key=lambda f: f.stat().st_mtime)
 
 def inspect_session(session_file):
-    idle_seconds = time.time() - session_file.stat().st_mtime
+    last_event_time = session_file.stat().st_mtime
+    idle_seconds = time.time() - last_event_time
     active_tokens = 0
     message_count = 0
+    session_title = ""
+    last_prompt = ""
+    git_branch = ""
+    session_id = session_file.stem
     
     try:
         with open(session_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -40,6 +45,15 @@ def inspect_session(session_file):
                     data = json.loads(line)
                     message_count += 1
                     
+                    if "aiTitle" in data and not session_title:
+                        session_title = data["aiTitle"]
+                    if "lastPrompt" in data:
+                        last_prompt = data["lastPrompt"]
+                    if "gitBranch" in data and not git_branch:
+                        git_branch = data["gitBranch"]
+                    if "sessionId" in data:
+                        session_id = data["sessionId"]
+                    
                     # Check turn-level usage inside message
                     msg = data.get("message", {})
                     usage = msg.get("usage") if isinstance(msg, dict) else None
@@ -47,7 +61,6 @@ def inspect_session(session_file):
                         usage = data["usage"]
                         
                     if usage and isinstance(usage, dict):
-                        # Active context is cache_read + cache_creation + input_tokens
                         total_turn_tokens = (
                             usage.get("cache_read_input_tokens", 0) +
                             usage.get("cache_creation_input_tokens", 0) +
@@ -64,7 +77,14 @@ def inspect_session(session_file):
     if active_tokens == 0:
         active_tokens = min(int(session_file.stat().st_size / 4.0), 200000)
         
-    return idle_seconds, active_tokens, message_count
+    meta = {
+        "title": session_title or "Untitled Session",
+        "last_prompt": last_prompt,
+        "branch": git_branch,
+        "session_id": session_id[:8] if session_id else "unknown",
+        "last_active": time.strftime("%Y-%m-%d %H:%M", time.localtime(last_event_time)),
+    }
+    return idle_seconds, active_tokens, message_count, meta
 
 def main():
     import argparse
@@ -77,8 +97,9 @@ def main():
     if not session_file:
         sys.exit(0)
         
-    idle_seconds, tokens, messages = inspect_session(session_file)
+    idle_seconds, tokens, messages, meta = inspect_session(session_file)
     idle_minutes = int(idle_seconds // 60)
+    idle_hours = round(idle_seconds / 3600, 1)
     
     is_cold = idle_seconds > args.ttl
     
@@ -86,11 +107,20 @@ def main():
         penalty_tokens = int(tokens * CACHE_WRITE_MULTIPLIER)
         pct_of_5hr = round((penalty_tokens / 2500000) * 100, 1)
         
+        project_name = os.path.basename(os.getcwd())
+        time_display = f"{idle_hours}h ago ({meta['last_active']})" if idle_minutes >= 60 else f"{idle_minutes}m ago"
+        
         print("\n\033[1;33m⚠️  [Cold-Resume Guard] Prompt Cache Expired\033[0m")
-        print(f"• Idle Time: {idle_minutes} minutes (TTL is {args.ttl // 60}m)")
-        print(f"• Active Context: ~{tokens:,} tokens ({messages} events)")
-        print(f"• Cold Reload Hit: ~{penalty_tokens:,} weighted input tokens (~{pct_of_5hr}% of 5-hour allowance)")
-        print("\033[1mOptions:\033[0m Type \033[1;36m/clear\033[0m inside Claude Code for fresh handoff (~3k tokens).")
+        print(f"• \033[1mSession:\033[0m {meta['title']} \033[90m(id: {meta['session_id']})\033[0m")
+        if meta.get("branch"):
+            print(f"• \033[1mContext:\033[0m Project: \033[36m{project_name}\033[0m | Branch: \033[35m{meta['branch']}\033[0m")
+        if meta.get("last_prompt"):
+            prompt_preview = meta["last_prompt"][:80] + ("..." if len(meta["last_prompt"]) > 80 else "")
+            print(f"• \033[1mLast Prompt:\033[0m \"{prompt_preview}\"")
+        print(f"• \033[1mLast Active:\033[0m {time_display} · \033[90m(TTL is {args.ttl // 60}m)\033[0m")
+        print(f"• \033[1mAccumulated Context:\033[0m ~{tokens:,} tokens ({messages} events)")
+        print(f"• \033[1;31mCold Reload Penalty:\033[0m ~{penalty_tokens:,} weighted input tokens \033[1;31m(~{pct_of_5hr}% of 5-hour quota)\033[0m")
+        print("\n\033[1mOptions:\033[0m Type \033[1;36m/clear\033[0m inside Claude Code for fresh handoff (~3k tokens).")
         
         if not args.check_only:
             try:
