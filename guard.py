@@ -13,8 +13,34 @@ from pathlib import Path
 
 # Cache TTL constants
 CLAUDE_PRO_TTL = 3600    # 1 hour for Claude Pro / Team subscriptions
+CLAUDE_API_TTL = 300     # 5 minutes for direct Anthropic API keys
 CODEX_TTL = 600          # 10 minutes for OpenAI prompt caching
 CACHE_WRITE_MULTIPLIER = 1.25
+
+def parse_iso_timestamp(ts_str):
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except Exception:
+        return None
+
+def get_git_root(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        import subprocess
+        root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=path, text=True, stderr=subprocess.DEVNULL, timeout=2
+        ).strip()
+        if root and os.path.isdir(root):
+            return root
+    except Exception:
+        pass
+    return None
 
 def get_claude_project_dir(project_dir=None):
     if not project_dir:
@@ -23,15 +49,25 @@ def get_claude_project_dir(project_dir=None):
     if not claude_projects.exists():
         return None, []
     
-    sanitized = project_dir.replace("/", "%2F").replace(" ", "%20")
-    project_match = claude_projects / sanitized
-    target_dir = project_match if project_match.exists() else claude_projects
+    candidates = []
+    # Claude Code format: /Users/name/repo -> -Users-name-repo
+    candidates.append(claude_projects / project_dir.replace("/", "-"))
     
-    jsonl_files = list(target_dir.glob("**/*.jsonl"))
-    if not jsonl_files:
-        jsonl_files = list(claude_projects.glob("**/*.jsonl"))
+    # Also check git root if project_dir is inside a subfolder
+    git_root = get_git_root(project_dir)
+    if git_root and git_root != project_dir:
+        candidates.append(claude_projects / git_root.replace("/", "-"))
         
-    return target_dir, jsonl_files
+    # Legacy URL-encoded fallback
+    candidates.append(claude_projects / project_dir.replace("/", "%2F").replace(" ", "%20"))
+
+    for c in candidates:
+        if c.exists() and c.is_dir():
+            files = sorted(c.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if files:
+                return c, files
+
+    return None, []
 
 def get_codex_sessions_for_dir(project_dir=None):
     if not project_dir:
@@ -40,18 +76,25 @@ def get_codex_sessions_for_dir(project_dir=None):
     if not codex_sessions_dir.exists():
         return []
         
+    git_root = get_git_root(project_dir)
+    check_paths = [os.path.realpath(project_dir), project_dir]
+    if git_root and git_root != project_dir:
+        check_paths.extend([os.path.realpath(git_root), git_root])
+    check_paths = list(set(check_paths))
+        
     matching_files = []
-    # Search latest 50 rollout files
-    all_files = sorted(codex_sessions_dir.glob("**/*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)[:50]
+    # Search latest 200 rollout files
+    all_files = sorted(codex_sessions_dir.glob("**/*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)[:200]
     for f in all_files:
         try:
             with open(f, "r", encoding="utf-8", errors="ignore") as fh:
                 for _ in range(5):
                     line = fh.readline()
                     if not line: break
-                    if "session_meta" in line and project_dir in line:
-                        matching_files.append(f)
-                        break
+                    if "session_meta" in line:
+                        if any(p in line for p in check_paths):
+                            matching_files.append(f)
+                            break
         except Exception:
             continue
     return matching_files
@@ -74,22 +117,40 @@ def find_session(project_dir=None, session_query=None, agent="auto"):
     for f in codex_files:
         candidates.append((f, "codex", f.stat().st_mtime))
         
-    if not candidates:
-        return None, None
-        
     if session_query:
         query_clean = session_query.strip().lower()
         matches = [c for c in candidates if query_clean in c[0].name.lower()]
         if matches:
             best = max(matches, key=lambda c: c[2])
             return best[0], best[1]
+        # Query was specified but not found in current project:
+        # Search globally in ~/.claude and ~/.codex so cross-dir resume still works!
+        global_matches = []
+        if agent in ("auto", "claude"):
+            claude_projects = Path.home() / ".claude" / "projects"
+            if claude_projects.exists():
+                for f in claude_projects.glob(f"**/*{query_clean}*.jsonl"):
+                    global_matches.append((f, "claude", f.stat().st_mtime))
+        if agent in ("auto", "codex"):
+            codex_dir = Path.home() / ".codex" / "sessions"
+            if codex_dir.exists():
+                for f in codex_dir.glob(f"**/*{query_clean}*.jsonl"):
+                    global_matches.append((f, "codex", f.stat().st_mtime))
+        if global_matches:
+            best = max(global_matches, key=lambda c: c[2])
+            return best[0], best[1]
+        # Specified ID does not exist anywhere: return None, None
+        return None, None
             
+    if not candidates:
+        return None, None
+
     best = max(candidates, key=lambda c: c[2])
     return best[0], best[1]
 
 def inspect_claude_session(session_file):
     last_event_time = session_file.stat().st_mtime
-    idle_seconds = time.time() - last_event_time
+    latest_ts = None
     active_tokens = 0
     message_count = 0
     session_title = ""
@@ -104,6 +165,11 @@ def inspect_claude_session(session_file):
                 try:
                     data = json.loads(line)
                     message_count += 1
+                    
+                    if "timestamp" in data:
+                        t_epoch = parse_iso_timestamp(data["timestamp"])
+                        if t_epoch:
+                            latest_ts = t_epoch
                     
                     if "aiTitle" in data and not session_title:
                         session_title = data["aiTitle"]
@@ -132,6 +198,10 @@ def inspect_claude_session(session_file):
     except Exception:
         pass
     
+    if latest_ts:
+        last_event_time = latest_ts
+    idle_seconds = max(0, time.time() - last_event_time)
+
     if active_tokens == 0:
         active_tokens = min(int(session_file.stat().st_size / 4.0), 200000)
         
@@ -149,7 +219,7 @@ def inspect_claude_session(session_file):
 
 def inspect_codex_session(session_file):
     last_event_time = session_file.stat().st_mtime
-    idle_seconds = time.time() - last_event_time
+    latest_ts = None
     active_tokens = 0
     message_count = 0
     session_id = None
@@ -164,6 +234,11 @@ def inspect_codex_session(session_file):
                     data = json.loads(line)
                     message_count += 1
                     t = data.get("type", "")
+                    
+                    if "timestamp" in data:
+                        t_epoch = parse_iso_timestamp(data["timestamp"])
+                        if t_epoch:
+                            latest_ts = t_epoch
                     
                     if t == "session_meta":
                         session_id = data.get("payload", {}).get("session_id")
@@ -204,6 +279,10 @@ def inspect_codex_session(session_file):
                 break
         if not session_id:
             session_id = session_file.stem[:8]
+
+    if latest_ts:
+        last_event_time = latest_ts
+    idle_seconds = max(0, time.time() - last_event_time)
 
     if active_tokens == 0:
         active_tokens = min(int(session_file.stat().st_size / 4.0), 100000)
@@ -281,12 +360,43 @@ codex() {
 
 def copy_to_clipboard(text):
     import subprocess
+    # 1. macOS pbcopy
     try:
         proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE, close_fds=True)
         proc.communicate(text.encode("utf-8"))
-        return True
+        if proc.returncode == 0:
+            return True
     except Exception:
-        return False
+        pass
+
+    # 2. Wayland wl-copy
+    try:
+        proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE, close_fds=True)
+        proc.communicate(text.encode("utf-8"))
+        if proc.returncode == 0:
+            return True
+    except Exception:
+        pass
+
+    # 3. X11 xclip
+    try:
+        proc = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE, close_fds=True)
+        proc.communicate(text.encode("utf-8"))
+        if proc.returncode == 0:
+            return True
+    except Exception:
+        pass
+
+    # 4. X11 xsel
+    try:
+        proc = subprocess.Popen(["xsel", "-b", "-i"], stdin=subprocess.PIPE, close_fds=True)
+        proc.communicate(text.encode("utf-8"))
+        if proc.returncode == 0:
+            return True
+    except Exception:
+        pass
+
+    return False
 
 def generate_handoff_prompt(project_name, meta):
     branch = meta.get("branch") or "main"
@@ -298,7 +408,7 @@ def generate_handoff_prompt(project_name, meta):
     last_commit = ""
     try:
         import subprocess
-        status = subprocess.check_output(["git", "status", "-s"], text=True, stderr=subprocess.DEVNULL)
+        status = subprocess.check_output(["git", "status", "-s"], text=True, stderr=subprocess.DEVNULL, timeout=2)
         for line in status.strip().split("\n"):
             if line.strip():
                 parts = line.strip().split(maxsplit=1)
@@ -309,7 +419,7 @@ def generate_handoff_prompt(project_name, meta):
 
     try:
         import subprocess
-        last_commit = subprocess.check_output(["git", "log", "-1", "--oneline"], text=True, stderr=subprocess.DEVNULL).strip()
+        last_commit = subprocess.check_output(["git", "log", "-1", "--oneline"], text=True, stderr=subprocess.DEVNULL, timeout=2).strip()
     except Exception:
         pass
 
@@ -486,8 +596,10 @@ Options:
         forward_args.append(arg)
         i += 1
 
-    # If run directly as `cold-resume-guard` without args and without --agent, it means guard-resume latest
-    if not explicit_agent and not is_resume and len(sys.argv) == 1:
+    # If run directly as `cold-resume-guard` / `claude-guard` / `codex-guard` without a command,
+    # and not called from the shell wrapper (explicit_agent is False):
+    # Guard-resume the latest session in the project.
+    if not explicit_agent and not is_resume and not check_only:
         is_resume = True
 
     # If starting a new session (e.g. `codex` or `claude`), not resuming an existing one:
@@ -506,7 +618,8 @@ Options:
     idle_minutes = int(idle_seconds // 60)
     idle_hours = round(idle_seconds / 3600, 1)
     
-    ttl = ttl_override or (CODEX_TTL if agent_type == "codex" else CLAUDE_PRO_TTL)
+    claude_ttl = CLAUDE_API_TTL if os.environ.get("ANTHROPIC_API_KEY") else CLAUDE_PRO_TTL
+    ttl = ttl_override or (CODEX_TTL if agent_type == "codex" else claude_ttl)
     is_cold = idle_seconds > ttl
     
     # Ensure shorthand session IDs are normalized to resume syntax for underlying agent
