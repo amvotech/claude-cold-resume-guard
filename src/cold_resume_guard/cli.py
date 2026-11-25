@@ -7,8 +7,11 @@ estimated token penalties before sending cold resumes over the network.
 
 import sys
 import os
+import re
 import json
 import time
+import shutil
+import subprocess
 from pathlib import Path
 
 # Cache TTL constants
@@ -16,47 +19,78 @@ CLAUDE_PRO_TTL = 3600    # 1 hour for Claude Pro / Team subscriptions
 CODEX_TTL = 600          # 10 minutes for OpenAI prompt caching
 CACHE_WRITE_MULTIPLIER = 1.25
 
-def get_claude_project_dir(project_dir=None):
+IS_WINDOWS = sys.platform.startswith("win")
+PASTE_KEY = "Ctrl+V" if IS_WINDOWS else "⌘V"
+
+def claude_project_folder_name(path):
+    """Claude Code names each project folder after the working directory, with every
+    character that isn't a letter or digit replaced by '-' (C:\\Users\\me\\app -> C--Users-me-app)."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+def get_claude_project_dir(project_dir=None, home=None):
     if not project_dir:
         project_dir = os.getcwd()
-    claude_projects = Path.home() / ".claude" / "projects"
+    claude_projects = (home or Path.home()) / ".claude" / "projects"
     if not claude_projects.exists():
         return None, []
-    
-    sanitized = project_dir.replace("/", "%2F").replace(" ", "%20")
-    project_match = claude_projects / sanitized
-    target_dir = project_match if project_match.exists() else claude_projects
-    
-    jsonl_files = list(target_dir.glob("**/*.jsonl"))
-    if not jsonl_files:
-        jsonl_files = list(claude_projects.glob("**/*.jsonl"))
-        
-    return target_dir, jsonl_files
 
-def get_codex_sessions_for_dir(project_dir=None):
+    project_match = claude_projects / claude_project_folder_name(os.path.realpath(project_dir))
+    if not project_match.is_dir():
+        return None, []
+    return project_match, list(project_match.glob("**/*.jsonl"))
+
+def get_all_claude_sessions(home=None):
+    claude_projects = (home or Path.home()) / ".claude" / "projects"
+    if not claude_projects.exists():
+        return []
+    return list(claude_projects.glob("**/*.jsonl"))
+
+def normalize_path(path, windows=None):
+    """Comparable form of a path: Windows paths ignore case and separator style."""
+    if IS_WINDOWS if windows is None else windows:
+        return path.replace("/", "\\").rstrip("\\").lower()
+    return path.rstrip("/") or "/"
+
+def codex_session_cwd(session_file):
+    """The working directory recorded in a Codex rollout's session_meta line, or None."""
+    try:
+        with open(session_file, "r", encoding="utf-8", errors="ignore") as fh:
+            for _ in range(5):
+                line = fh.readline()
+                if not line:
+                    break
+                if "session_meta" not in line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                if data.get("type") != "session_meta":
+                    continue
+                payload = data.get("payload") or {}
+                return payload.get("cwd") or data.get("cwd")
+    except OSError:
+        return None
+    return None
+
+def get_codex_sessions_for_dir(project_dir=None, home=None, windows=None):
     if not project_dir:
         project_dir = os.getcwd()
-    codex_sessions_dir = Path.home() / ".codex" / "sessions"
+    codex_sessions_dir = (home or Path.home()) / ".codex" / "sessions"
     if not codex_sessions_dir.exists():
         return []
-        
+
+    wanted = normalize_path(os.path.realpath(project_dir), windows)
     matching_files = []
     # Search latest 50 rollout files
     all_files = sorted(codex_sessions_dir.glob("**/*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)[:50]
     for f in all_files:
-        try:
-            with open(f, "r", encoding="utf-8", errors="ignore") as fh:
-                for _ in range(5):
-                    line = fh.readline()
-                    if not line: break
-                    if "session_meta" in line and project_dir in line:
-                        matching_files.append(f)
-                        break
-        except Exception:
-            continue
+        cwd = codex_session_cwd(f)
+        if cwd and normalize_path(cwd, windows) == wanted:
+            matching_files.append(f)
     return matching_files
 
-def find_session(project_dir=None, session_query=None, agent="auto"):
+def find_session(project_dir=None, session_query=None, agent="auto", home=None):
     if not project_dir:
         project_dir = os.getcwd()
         
@@ -64,9 +98,9 @@ def find_session(project_dir=None, session_query=None, agent="auto"):
     codex_files = []
     
     if agent in ("auto", "claude"):
-        _, claude_files = get_claude_project_dir(project_dir)
+        _, claude_files = get_claude_project_dir(project_dir, home=home)
     if agent in ("auto", "codex"):
-        codex_files = get_codex_sessions_for_dir(project_dir)
+        codex_files = get_codex_sessions_for_dir(project_dir, home=home)
         
     candidates = []
     for f in claude_files:
@@ -230,13 +264,17 @@ def list_recent_sessions(limit=8):
     codex_files = get_codex_sessions_for_dir()
     
     candidates = [(f, "claude") for f in claude_files] + [(f, "codex") for f in codex_files]
+    heading = "Recent AI Sessions in this project:"
     if not candidates:
-        print("No coding agent sessions found for this directory.")
+        candidates = [(f, "claude") for f in get_all_claude_sessions()]
+        heading = "No sessions for this folder. Recent Claude Code sessions in all projects:"
+    if not candidates:
+        print("No coding agent sessions found.")
         return
         
     sorted_files = sorted(candidates, key=lambda c: c[0].stat().st_mtime, reverse=True)[:limit]
     
-    print(f"\n\033[1mRecent AI Sessions in this project:\033[0m")
+    print(f"\n\033[1m{heading}\033[0m")
     print(f"{'AGENT':<13} {'ID':<10} {'STATUS':<8} {'CONTEXT':<12} {'LAST ACTIVE':<14} {'TITLE'}")
     print("-" * 88)
     
@@ -249,44 +287,199 @@ def list_recent_sessions(limit=8):
         print(f"{meta['agent']:<13} {meta['session_id']:<10} {status:<17} ~{tokens:<10,} {idle_h:<14} {title_trunc}")
     print()
 
-def install_shell_hook():
-    home = Path.home()
-    zshrc = home / ".zshrc"
-    bashrc = home / ".bashrc"
-    target = zshrc if zshrc.exists() else bashrc
-    
-    snippet = """
-# >>> cold-resume-guard begin >>>
-claude() {
-    cold-resume-guard "$@"
-}
-codex() {
+HOOK_BEGIN = "# >>> cold-resume-guard begin >>>"
+HOOK_END = "# <<< cold-resume-guard end <<<"
+
+POSIX_SNIPPET = f"""
+{HOOK_BEGIN}
+claude() {{
+    cold-resume-guard --agent claude "$@"
+}}
+codex() {{
     cold-resume-guard --agent codex "$@"
-}
-# <<< cold-resume-guard end <<<
+}}
+{HOOK_END}
 """
+
+# Git Bash only finds .exe programs by bare name; install.ps1 installs cold-resume-guard.cmd.
+GIT_BASH_SNIPPET = f"""
+{HOOK_BEGIN}
+_cold_resume_guard() {{
+    if command -v cold-resume-guard >/dev/null 2>&1; then cold-resume-guard "$@"; else cold-resume-guard.cmd "$@"; fi
+}}
+claude() {{
+    _cold_resume_guard --agent claude "$@"
+}}
+codex() {{
+    _cold_resume_guard --agent codex "$@"
+}}
+{HOOK_END}
+"""
+
+POWERSHELL_SNIPPET = f"""
+{HOOK_BEGIN}
+function claude {{ cold-resume-guard --agent claude @args }}
+function codex {{ cold-resume-guard --agent codex @args }}
+{HOOK_END}
+"""
+
+def powershell_profiles(home, which=None, run=None):
+    """Profile paths for Windows PowerShell 5.1 and PowerShell 7, asked from PowerShell itself
+    (Documents may be redirected to OneDrive), falling back to the default locations."""
+    defaults = {
+        "powershell": home / "Documents" / "WindowsPowerShell" / "Microsoft.PowerShell_profile.ps1",
+        "pwsh": home / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1",
+    }
+    which = which or shutil.which
+    run = run or subprocess.run
+    profiles = []
+    for exe, default in defaults.items():
+        if not which(exe):
+            continue
+        path = default
+        try:
+            out = run([exe, "-NoProfile", "-Command", "$PROFILE.CurrentUserCurrentHost"],
+                      capture_output=True, text=True, timeout=20)
+            if out.returncode == 0 and out.stdout.strip():
+                path = Path(out.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
+        profiles.append(path)
+    return profiles
+
+def shell_hook_targets(home=None, windows=None, which=None, run=None):
+    """(file, snippet) pairs the wrappers go into on this platform."""
+    home = home or Path.home()
+    if IS_WINDOWS if windows is None else windows:
+        targets = [(p, POWERSHELL_SNIPPET) for p in powershell_profiles(home, which, run)]
+        targets.append((home / ".bashrc", GIT_BASH_SNIPPET))
+        return targets
+    zshrc = home / ".zshrc"
+    return [(zshrc if zshrc.exists() else home / ".bashrc", POSIX_SNIPPET)]
+
+HOOK_BLOCK = re.compile(r"\n?" + re.escape(HOOK_BEGIN) + r".*?" + re.escape(HOOK_END) + r"\n?", re.DOTALL)
+
+def add_hook_block(path, snippet):
+    """Install the wrapper block: "added", "updated" (an older block was replaced) or None (already current)."""
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    match = HOOK_BLOCK.search(content)
+    if match:
+        if match.group(0).strip() == snippet.strip():
+            return None
+        path.write_text(content[:match.start()] + snippet + content[match.end():], encoding="utf-8")
+        return "updated"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(snippet)
+    return "added"
+
+def remove_hook_block(path):
+    """Delete exactly the wrapper block written by add_hook_block. Returns True if the file changed."""
+    if not path.exists():
+        return False
+    content = path.read_text(encoding="utf-8")
+    updated, count = HOOK_BLOCK.subn("", content, count=1)
+    if not count:
+        return False
+    if updated.strip():
+        path.write_text(updated, encoding="utf-8")
+    else:
+        path.unlink()  # setup created it (or it held only our block): leave no empty file behind
+    return True
+
+POWERSHELL_EDITIONS = (("powershell", "Windows PowerShell"), ("pwsh", "PowerShell 7"))
+ALLOW_PROFILES_CMD = 'powershell -NoProfile -Command "Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"'
+
+def powershell_editions_blocking(which=None, run=None):
+    """Names of installed PowerShell editions whose execution policy stops the profile from loading.
+    Each edition keeps its own policy: PowerShell 7 allows profiles by default, Windows PowerShell doesn't."""
+    which = which or shutil.which
+    run = run or subprocess.run
+    blocked = []
+    for exe, name in POWERSHELL_EDITIONS:
+        if not which(exe):
+            continue
+        try:
+            out = run([exe, "-NoProfile", "-Command", "Get-ExecutionPolicy"],
+                      capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.stdout.strip().lower() in ("restricted", "allsigned", "undefined"):
+            blocked.append(name)
+    return blocked
+
+def install_shell_hook():
     try:
-        content = target.read_text(encoding="utf-8") if target.exists() else ""
-        if "cold-resume-guard begin" in content:
-            print(f"✓ Shell hooks already installed in {target}")
-            return
-            
-        with open(target, "a", encoding="utf-8") as f:
-            f.write(snippet)
-        print(f"\033[1;32m✓ Shell hooks successfully added to {target}!\033[0m")
-        print(f"Run: \033[1;36msource {target}\033[0m (or restart your terminal) to activate.")
-    except Exception as e:
+        for path, snippet in shell_hook_targets():
+            result = add_hook_block(path, snippet)
+            if result:
+                print(f"\033[1;32m✓ Shell wrappers {result} in {path}\033[0m")
+            else:
+                print(f"✓ Shell wrappers already installed in {path}")
+    except OSError as e:
         print(f"\033[1;31mError updating shell config: {e}\033[0m")
         sys.exit(1)
+    if IS_WINDOWS:
+        blocked = powershell_editions_blocking()
+        if blocked:
+            print(f"\n\033[1;33m{' and '.join(blocked)} is set to block profile scripts, so the wrappers won't load there yet.\033[0m")
+            print("To allow them for your account only, run this once (from any terminal):")
+            if "PowerShell 7" in blocked:
+                print('  \033[1;36mpwsh -NoProfile -Command "Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"\033[0m')
+            if "Windows PowerShell" in blocked:
+                print(f"  \033[1;36m{ALLOW_PROFILES_CMD}\033[0m")
+        print("Open a new PowerShell or Git Bash window to activate.")
+    else:
+        print("Restart your terminal (or source your shell config) to activate.")
 
-def copy_to_clipboard(text):
-    import subprocess
+def remove_shell_hook():
     try:
-        proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE, close_fds=True)
-        proc.communicate(text.encode("utf-8"))
-        return True
-    except Exception:
+        changed = [p for p, _ in shell_hook_targets() if remove_hook_block(p)]
+    except OSError as e:
+        print(f"\033[1;31mError updating shell config: {e}\033[0m")
+        sys.exit(1)
+    for p in changed:
+        print(f"\033[1;32m✓ Shell wrappers removed from {p}\033[0m")
+    if not changed:
+        print("No cold-resume-guard shell wrappers found.")
+
+def is_wsl():
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="ignore") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
         return False
+
+def clipboard_commands(platform=None, environ=None, which=None, wsl=None):
+    """Clipboard commands to try in order, each with the text encoding it expects."""
+    platform = platform or sys.platform
+    environ = os.environ if environ is None else environ
+    which = which or shutil.which
+    if platform == "darwin":
+        return [(["pbcopy"], "utf-8")]
+    if platform.startswith("win"):
+        # clip.exe reads UTF-16LE when the input starts with a byte-order mark.
+        return [(["clip.exe"], "utf-16")]
+    commands = []
+    if wsl if wsl is not None else is_wsl():
+        commands.append((["clip.exe"], "utf-16"))
+    if environ.get("WAYLAND_DISPLAY") and which("wl-copy"):
+        commands.append((["wl-copy"], "utf-8"))
+    if which("xclip"):
+        commands.append((["xclip", "-selection", "clipboard"], "utf-8"))
+    return commands
+
+def copy_to_clipboard(text, commands=None, popen=None):
+    popen = popen or subprocess.Popen
+    for cmd, encoding in (commands if commands is not None else clipboard_commands()):
+        try:
+            proc = popen(cmd, stdin=subprocess.PIPE, close_fds=True)
+            proc.communicate(text.encode(encoding))
+            if proc.returncode == 0:
+                return True
+        except OSError:
+            continue
+    return False
 
 def generate_handoff_prompt(project_name, meta):
     branch = meta.get("branch") or "main"
@@ -336,7 +529,7 @@ def extract_forward_args(argv):
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg in ("--check-only", "--list", "-l", "--setup", "--install-hook"):
+        if arg in ("--check-only", "--list", "-l", "--setup", "--install-hook", "--remove"):
             i += 1
             continue
         if arg in ("--ttl",):
@@ -352,16 +545,58 @@ def extract_forward_args(argv):
         i += 1
     return forward
 
-def launch_agent(agent_type, forward_args):
+def launch_agent(agent_type, forward_args, windows=None):
+    """Hand over to the real agent. Never returns."""
     cmd = "codex" if agent_type == "codex" else "claude"
+    if IS_WINDOWS if windows is None else windows:
+        # exec can't run npm .cmd shims and doesn't replace the process on Windows,
+        # so run the agent as a child, let it own Ctrl+C, and pass its exit code on.
+        exe = shutil.which(cmd)
+        if not exe:
+            print(f"\033[1;31mError: '{cmd}' command not found in your PATH.\033[0m")
+            sys.exit(1)
+        proc = subprocess.Popen([exe] + forward_args)
+        while True:
+            try:
+                sys.exit(proc.wait())
+            except KeyboardInterrupt:
+                continue
     try:
         os.execvp(cmd, [cmd] + forward_args)
     except FileNotFoundError:
         print(f"\033[1;31mError: '{cmd}' command not found in your PATH.\033[0m")
         sys.exit(1)
 
+ANSI_ESCAPE = re.compile(r"\033\[[0-9;]*m")
+
+class _PlainOutput:
+    """Wraps stdout and drops colour codes, for pipes, files and NO_COLOR."""
+    def __init__(self, stream):
+        self._stream = stream
+    def write(self, text):
+        return self._stream.write(ANSI_ESCAPE.sub("", text))
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+def setup_colours(stream=None, environ=None, windows=None):
+    """Returns the stream to print to: colour on a terminal, plain otherwise."""
+    stream = stream or sys.stdout
+    environ = os.environ if environ is None else environ
+    # Redirected output on Windows uses a legacy code page without ✓ ⚠️ 📋; never crash over a symbol.
+    if hasattr(stream, "reconfigure"):
+        try:
+            stream.reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+    if environ.get("NO_COLOR") or not stream.isatty():
+        return _PlainOutput(stream)
+    if IS_WINDOWS if windows is None else windows:
+        os.system("")  # switches the Windows console into ANSI mode
+    return stream
+
 def main():
-    prog_name = os.path.basename(sys.argv[0])
+    sys.stdout = setup_colours()
+    prog_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
     
     # Infer agent preference from binary name or flags
     default_agent = "auto"
@@ -385,7 +620,8 @@ Commands:
   cold-resume-guard --resume <id> Inspect specific Claude session before resuming
   cold-resume-guard resume <id>  Inspect specific Codex session before resuming
   cold-resume-guard --list, -l   List recent sessions in project with TTL status & tokens
-  cold-resume-guard --setup      Automatically add shell wrappers to ~/.zshrc or ~/.bashrc
+  cold-resume-guard --setup      Add claude/codex shell wrappers (zsh/bash; PowerShell + Git Bash on Windows)
+  cold-resume-guard --remove     Remove the shell wrappers again
   cold-resume-guard --check-only Inspect session and print metrics without launching
 
 Options:
@@ -397,6 +633,10 @@ Options:
 
     if "--setup" in sys.argv or "--install-hook" in sys.argv:
         install_shell_hook()
+        sys.exit(0)
+
+    if "--remove" in sys.argv:
+        remove_shell_hook()
         sys.exit(0)
 
     if "--list" in sys.argv or "-l" in sys.argv:
@@ -464,7 +704,9 @@ Options:
 
     session_file, agent_type = find_session(session_query=session_query, agent=agent)
     if not session_file:
-        if not check_only:
+        if check_only:
+            print("No Claude Code or Codex sessions found for this folder.")
+        else:
             launch_agent("codex" if agent == "codex" else "claude", forward_args)
         sys.exit(0)
         
@@ -484,6 +726,9 @@ Options:
             if not any(a in ("--resume", "-r") for a in forward_args):
                 forward_args = ["--resume", meta["full_id"]] + [a for a in forward_args if a != session_query]
     
+    if check_only and not (is_cold and tokens > 20000):
+        state = "cache still warm" if not is_cold else f"cache expired, but only ~{tokens:,} tokens, so resuming is cheap"
+        print(f"✓ {meta['agent']} session {meta['session_id']} ({meta['title']}): {state}.")
     if is_cold and tokens > 20000:
         penalty_tokens = int(tokens * CACHE_WRITE_MULTIPLIER)
         pct_of_5h = round((penalty_tokens / 2500000) * 100, 1)
@@ -514,7 +759,7 @@ Options:
                     if copied:
                         print("\033[1;36m📋 Rich handoff prompt copied to your clipboard:\033[0m")
                         print("\033[90m" + "\n".join("   " + line for line in handoff.split("\n")) + "\033[0m\n")
-                        print(f"Run a fresh session (\033[1m{meta['agent'].split()[0].lower()}\033[0m) and press \033[1m⌘V\033[0m to continue at ~3k tokens.")
+                        print(f"Run a fresh session (\033[1m{meta['agent'].split()[0].lower()}\033[0m) and press \033[1m{PASTE_KEY}\033[0m to continue at ~3k tokens.")
                     else:
                         print(f"\033[1mHandoff prompt:\033[0m\n{handoff}\n")
                     print("\033[90mBuilt with ❤️ by L2Cache — Native developer memory & MCP server for Mac: https://l2cache.app\033[0m\n")

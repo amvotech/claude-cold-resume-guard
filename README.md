@@ -70,11 +70,11 @@ brew install l2cache-app/tap/cold-resume-guard && cold-resume-guard --setup
 curl -fsSL https://raw.githubusercontent.com/l2cache-app/claude-cold-resume-guard/main/install.sh | bash
 ```
 
-### 3. via pip / pipx (Python developers)
-```bash
-pip install claude-cold-resume-guard
-cold-resume-guard --setup
+### 3. Windows (PowerShell)
+```powershell
+irm https://raw.githubusercontent.com/l2cache-app/claude-cold-resume-guard/main/install.ps1 | iex
 ```
+Then open a new terminal and run `cold-resume-guard --setup`. Needs Python 3.8+ (`winget install --id Python.Python.3.13 -e`). Works in PowerShell, Git Bash and WSL. Inside WSL, use the Linux installer above.
 
 ### 4. Git Clone
 ```bash
@@ -127,7 +127,7 @@ Run:
 ```bash
 cold-resume-guard --setup
 ```
-This safely detects your shell (`~/.zshrc` or `~/.bashrc`) and adds the transparent function wrappers:
+This safely detects your shell (`~/.zshrc` or `~/.bashrc`; on Windows, your PowerShell profile and Git Bash's `~/.bashrc`) and adds the transparent function wrappers:
 ```bash
 claude() {
     cold-resume-guard "$@"
@@ -138,11 +138,20 @@ codex() {
 ```
 Then reload your terminal: `source ~/.zshrc`.
 
+On Windows, PowerShell gets the equivalent:
+```powershell
+function claude { cold-resume-guard @args }
+function codex { cold-resume-guard --agent codex @args }
+```
+Windows PowerShell (5.1) blocks profile scripts by default; PowerShell 7 allows them. Each keeps its own setting, so `--setup` names the edition that blocks them and prints the one command that allows them for your account, e.g. `powershell -NoProfile -Command "Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"`. It never changes the policy itself.
+
+To undo the setup on any platform: `cold-resume-guard --remove`.
+
 ### Option B: Manual Setup
 Add the snippet above to your `~/.zshrc` or `~/.bashrc` manually.
 
 ### Why a shell function instead of an alias?
-In POSIX shells, an alias like `alias claude="cold-resume-guard && claude"` drops arguments passed to the first command, so running `claude --resume <id>` would leave `cold-resume-guard` without the session ID. Using a shell function forwards all arguments (`--resume <id>`, `resume <id>`, prompts, and flags) to `cold-resume-guard`. The guard checks the exact session on disk, warns you if cold, and once confirmed (or if warm), launches `claude` or `codex` directly via process execution (`os.execvp`).
+In POSIX shells, an alias like `alias claude="cold-resume-guard && claude"` drops arguments passed to the first command, so running `claude --resume <id>` would leave `cold-resume-guard` without the session ID. Using a shell function forwards all arguments (`--resume <id>`, `resume <id>`, prompts, and flags) to `cold-resume-guard`. The guard checks the exact session on disk, warns you if cold, and once confirmed (or if warm), launches `claude` or `codex` directly via process execution (`os.execvp`; on Windows it runs the agent as a child process and passes its exit code back).
 
 ---
 

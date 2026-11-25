@@ -3,7 +3,7 @@ set -euo pipefail
 
 INSTALL_DIR="$HOME/.local/bin"
 GUARD_FILE="$INSTALL_DIR/cold-resume-guard"
-RAW_URL="https://raw.githubusercontent.com/amvotech/claude-cold-resume-guard/main/guard.py"
+RAW_URL="https://raw.githubusercontent.com/l2cache-app/claude-cold-resume-guard/main/guard.py"
 
 echo "==> Installing claude-cold-resume-guard..."
 
