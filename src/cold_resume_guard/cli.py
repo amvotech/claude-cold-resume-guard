@@ -258,7 +258,7 @@ def install_shell_hook():
     snippet = """
 # >>> cold-resume-guard begin >>>
 claude() {
-    cold-resume-guard "$@"
+    cold-resume-guard --agent claude "$@"
 }
 codex() {
     cold-resume-guard --agent codex "$@"
@@ -408,59 +408,93 @@ Options:
     agent = default_agent
     ttl_override = None
     check_only = "--check-only" in sys.argv
+    is_resume = False
+    explicit_agent = False
 
+    forward_args = []
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
-        if arg in ("--agent", "-a") and i + 1 < len(sys.argv):
-            agent = sys.argv[i + 1]
-            i += 2
-            continue
-        elif arg.startswith("--agent="):
-            agent = arg.split("=", 1)[1]
+        if arg in ("--check-only", "--list", "-l", "--setup", "--install-hook"):
             i += 1
             continue
-        elif arg == "--ttl" and i + 1 < len(sys.argv):
-            try:
-                ttl_override = int(sys.argv[i + 1])
-            except ValueError:
-                pass
-            i += 2
+        if arg in ("--ttl",):
+            if i + 1 < len(sys.argv):
+                try:
+                    ttl_override = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+                continue
+            i += 1
             continue
-        elif arg.startswith("--ttl="):
+        if arg.startswith("--ttl="):
             try:
                 ttl_override = int(arg.split("=", 1)[1])
             except ValueError:
                 pass
             i += 1
             continue
-        elif arg in ("--resume", "-r") and i + 1 < len(sys.argv):
-            session_query = sys.argv[i + 1]
-            i += 2
+        if arg in ("--agent", "-a"):
+            if i + 1 < len(sys.argv):
+                agent = sys.argv[i + 1]
+                explicit_agent = True
+                i += 2
+                continue
+            i += 1
+            continue
+        if arg.startswith("--agent="):
+            agent = arg.split("=", 1)[1]
+            explicit_agent = True
+            i += 1
+            continue
+        if arg in ("--resume", "-r"):
+            is_resume = True
+            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                session_query = sys.argv[i + 1]
+                i += 2
+                continue
+            i += 1
             continue
         elif arg.startswith("--resume="):
+            is_resume = True
             session_query = arg.split("=", 1)[1]
             i += 1
             continue
-        elif arg == "resume" and i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
-            session_query = sys.argv[i + 1]
-            if agent == "auto":
-                agent = "codex"
-            i += 2
-            continue
-        elif arg == "resume" and (i + 1 == len(sys.argv) or sys.argv[i + 1].startswith("-")):
-            # `codex resume` or `codex resume --last`
-            if agent == "auto":
-                agent = "codex"
+        elif arg == "--continue":
+            is_resume = True
             i += 1
             continue
-        elif not arg.startswith("-") and len(arg) >= 6 and not session_query:
-            session_query = arg
+        elif arg == "resume":
+            is_resume = True
+            if agent == "auto":
+                agent = "codex"
+            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                session_query = sys.argv[i + 1]
+                i += 2
+                continue
             i += 1
             continue
+        elif not arg.startswith("-") and not session_query:
+            import re
+            # Valid session ID: hex or UUID (6 to 36 chars of 0-9a-fA-F and hyphens)
+            if re.match(r'^[0-9a-fA-F]{6,36}$', arg) or re.match(r'^[0-9a-fA-F-]{8,36}$', arg):
+                session_query = arg
+                is_resume = True
+                i += 1
+                continue
+        forward_args.append(arg)
         i += 1
 
-    forward_args = extract_forward_args(sys.argv[1:])
+    # If run directly as `cold-resume-guard` without args and without --agent, it means guard-resume latest
+    if not explicit_agent and not is_resume and len(sys.argv) == 1:
+        is_resume = True
+
+    # If starting a new session (e.g. `codex` or `claude`), not resuming an existing one:
+    # A fresh session has 0 accumulated context and no prompt cache penalty. Launch directly.
+    if not is_resume and not check_only:
+        launch_agent("codex" if agent == "codex" else "claude", forward_args)
+        sys.exit(0)
 
     session_file, agent_type = find_session(session_query=session_query, agent=agent)
     if not session_file:
@@ -476,13 +510,19 @@ Options:
     is_cold = idle_seconds > ttl
     
     # Ensure shorthand session IDs are normalized to resume syntax for underlying agent
-    if session_query:
+    if is_resume:
         if agent_type == "codex":
             if "resume" not in forward_args:
-                forward_args = ["resume", meta["session_id"]] + [a for a in forward_args if a != session_query]
+                if session_query:
+                    forward_args = ["resume", meta["session_id"]] + [a for a in forward_args if a != session_query]
+                else:
+                    forward_args = ["resume"] + forward_args
         else:
             if not any(a in ("--resume", "-r") for a in forward_args):
-                forward_args = ["--resume", meta["full_id"]] + [a for a in forward_args if a != session_query]
+                if session_query:
+                    forward_args = ["--resume", meta["full_id"]] + [a for a in forward_args if a != session_query]
+                else:
+                    forward_args = ["--resume"] + forward_args
     
     if is_cold and tokens > 20000:
         penalty_tokens = int(tokens * CACHE_WRITE_MULTIPLIER)
@@ -528,9 +568,7 @@ Options:
                 print("\033[90mBuilt with ❤️ by L2Cache — Native developer memory & MCP server for Mac: https://l2cache.app\033[0m\n")
                 sys.exit(1)
         print()
-    elif not check_only:
-        launch_agent(agent_type, forward_args)
-
+    
     if not check_only:
         launch_agent(agent_type, forward_args)
 
