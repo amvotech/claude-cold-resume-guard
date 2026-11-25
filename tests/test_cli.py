@@ -142,7 +142,7 @@ def test_clipboard_commands_per_platform():
     assert cli.clipboard_commands("linux", {}, none, wsl=True) == [(["clip.exe"], "utf-16")]
     found = lambda name: "/usr/bin/" + name
     assert cli.clipboard_commands("linux", {"WAYLAND_DISPLAY": "w"}, found, wsl=False) == [
-        (["wl-copy"], "utf-8"), (["xclip", "-selection", "clipboard"], "utf-8")]
+        (["wl-copy"], "utf-8"), (["xclip", "-selection", "clipboard"], "utf-8"), (["xsel", "-b", "-i"], "utf-8")]
     assert cli.clipboard_commands("linux", {}, none, wsl=False) == []
 
 
@@ -449,6 +449,94 @@ def test_check_only_says_when_folder_has_no_sessions(tmp_path, monkeypatch, caps
         cli.main()
     assert e.value.code == 0
     assert "No Claude Code or Codex sessions found for this folder." in capsys.readouterr().out
+
+
+class _Launched(Exception):
+    pass
+
+
+def _run_main(monkeypatch, argv, cwd):
+    """Run main() and return (agent, args) it would launch, or None if it exited without launching."""
+    def fake_launch(agent, args, windows=None):
+        raise _Launched(agent, args)
+    monkeypatch.setattr(cli, "launch_agent", fake_launch)
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(cli.sys, "argv", argv)
+    monkeypatch.setattr(cli.sys, "stdout", cli.sys.stdout)
+    try:
+        cli.main()
+    except _Launched as e:
+        return e.args
+    except SystemExit:
+        return None
+
+
+def _old_big_session(home, proj):
+    s = _claude_session(home, proj, name="f39616a9-1111.jsonl")
+    s.write_text('{"sessionId":"f39616a9-1111","timestamp":"2020-01-01T00:00:00Z",'
+                 '"message":{"usage":{"cache_read_input_tokens":90000}}}\n', encoding="utf-8")
+    return s
+
+
+def test_fresh_claude_through_wrapper_skips_the_check(tmp_path, monkeypatch, capsys):
+    """A new session reloads nothing, so `claude` (wrapper adds --agent claude) launches straight away."""
+    home, proj = tmp_path / "home", tmp_path / "proj"
+    proj.mkdir()
+    _old_big_session(home, proj)
+    monkeypatch.setattr(cli.Path, "home", lambda: home)
+    launched = _run_main(monkeypatch, ["cold-resume-guard", "--agent", "claude", "-p", "hi"], proj)
+    assert launched == ("claude", ["-p", "hi"])
+    assert "Expired" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv, forwarded", [
+    (["--agent", "claude", "--resume"], ["--resume"]),
+    (["--agent", "claude", "--continue"], ["--continue"]),
+    (["--agent", "claude", "-c"], ["-c"]),
+    (["--agent", "claude", "--resume", "f39616a9"], ["--resume", "f39616a9"]),
+    (["f39616a9"], ["--resume", "f39616a9-1111"]),  # bare ID: guard, then resume that session
+])
+def test_resume_commands_are_guarded_and_forwarded(argv, forwarded, tmp_path, monkeypatch, capsys):
+    home, proj = tmp_path / "home", tmp_path / "proj"
+    proj.mkdir()
+    _old_big_session(home, proj)
+    monkeypatch.setattr(cli.Path, "home", lambda: home)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")  # proceed despite the warning
+    launched = _run_main(monkeypatch, ["cold-resume-guard", "--ttl", "60"] + argv, proj)
+    assert "Prompt Cache Expired" in capsys.readouterr().out
+    assert launched == ("claude", forwarded)
+
+
+def test_codex_dash_c_is_config_not_continue(tmp_path, monkeypatch):
+    launched = _run_main(monkeypatch, ["cold-resume-guard", "--agent", "codex", "-c", "model=x"], tmp_path)
+    assert launched == ("codex", ["-c", "model=x"])
+
+
+def test_session_id_found_in_another_project(tmp_path, monkeypatch):
+    home, here, other = tmp_path / "home", tmp_path / "here", tmp_path / "other"
+    here.mkdir()
+    other.mkdir()
+    session = _old_big_session(home, other)
+    assert cli.find_session(project_dir=str(here), session_query="f39616a9", home=home) == (session, "claude")
+    assert cli.find_session(project_dir=str(here), session_query="deadbeef", home=home) == (None, None)
+
+
+def test_idle_time_comes_from_message_timestamps(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    s = _old_big_session(tmp_path / "home", proj)  # file is new, last message is from 2020
+    idle, tokens, _, _ = cli.inspect_session(s, "claude")
+    assert idle > 365 * 24 * 3600 and tokens == 90000
+    assert cli.parse_iso_timestamp("not a date") is None and cli.parse_iso_timestamp(None) is None
+
+
+def test_subfolder_matches_sessions_started_at_git_root(tmp_path, monkeypatch):
+    home, repo = tmp_path / "home", tmp_path / "repo"
+    sub = repo / "src" / "app"
+    sub.mkdir(parents=True)
+    session = _claude_session(home, repo)
+    monkeypatch.setattr(cli, "get_git_root", lambda p: os.path.realpath(repo))
+    assert cli.get_claude_project_dir(str(sub), home=home) == (session.parent, [session])
 
 
 # --- Arguments and packaging ---

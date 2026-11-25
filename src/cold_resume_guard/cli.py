@@ -16,11 +16,44 @@ from pathlib import Path
 
 # Cache TTL constants
 CLAUDE_PRO_TTL = 3600    # 1 hour for Claude Pro / Team subscriptions
+CLAUDE_API_TTL = 300     # 5 minutes for direct Anthropic API keys
 CODEX_TTL = 600          # 10 minutes for OpenAI prompt caching
 CACHE_WRITE_MULTIPLIER = 1.25
 
 IS_WINDOWS = sys.platform.startswith("win")
+GUARD_FLAGS = ("--check-only", "--list", "-l", "--setup", "--install-hook", "--remove")
+SESSION_ID = re.compile(r"^[0-9a-fA-F]{6,36}$|^[0-9a-fA-F-]{8,36}$")
 PASTE_KEY = "Ctrl+V" if IS_WINDOWS else "⌘V"
+
+def parse_iso_timestamp(ts_str):
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+def get_git_root(path):
+    """The repository root above path, so sessions started there match from any subfolder."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=path, text=True, stderr=subprocess.DEVNULL, timeout=2
+        ).strip()
+    except Exception:
+        return None
+    return os.path.realpath(root) if root and os.path.isdir(root) else None
+
+def project_paths(project_dir):
+    """The folder itself, then its git root if different."""
+    paths = [os.path.realpath(project_dir)]
+    root = get_git_root(project_dir)
+    if root and root not in paths:
+        paths.append(root)
+    return paths
 
 def claude_project_folder_name(path):
     """Claude Code names each project folder after the working directory, with every
@@ -34,10 +67,13 @@ def get_claude_project_dir(project_dir=None, home=None):
     if not claude_projects.exists():
         return None, []
 
-    project_match = claude_projects / claude_project_folder_name(os.path.realpath(project_dir))
-    if not project_match.is_dir():
-        return None, []
-    return project_match, list(project_match.glob("**/*.jsonl"))
+    for path in project_paths(project_dir):
+        folder = claude_projects / claude_project_folder_name(path)
+        if folder.is_dir():
+            files = sorted(folder.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if files:
+                return folder, files
+    return None, []
 
 def get_all_claude_sessions(home=None):
     claude_projects = (home or Path.home()) / ".claude" / "projects"
@@ -80,13 +116,13 @@ def get_codex_sessions_for_dir(project_dir=None, home=None, windows=None):
     if not codex_sessions_dir.exists():
         return []
 
-    wanted = normalize_path(os.path.realpath(project_dir), windows)
+    wanted = {normalize_path(p, windows) for p in project_paths(project_dir)}
     matching_files = []
-    # Search latest 50 rollout files
-    all_files = sorted(codex_sessions_dir.glob("**/*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)[:50]
+    # Search latest 200 rollout files
+    all_files = sorted(codex_sessions_dir.glob("**/*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)[:200]
     for f in all_files:
         cwd = codex_session_cwd(f)
-        if cwd and normalize_path(cwd, windows) == wanted:
+        if cwd and normalize_path(cwd, windows) in wanted:
             matching_files.append(f)
     return matching_files
 
@@ -108,22 +144,38 @@ def find_session(project_dir=None, session_query=None, agent="auto", home=None):
     for f in codex_files:
         candidates.append((f, "codex", f.stat().st_mtime))
         
-    if not candidates:
-        return None, None
-        
     if session_query:
         query_clean = session_query.strip().lower()
         matches = [c for c in candidates if query_clean in c[0].name.lower()]
         if matches:
             best = max(matches, key=lambda c: c[2])
             return best[0], best[1]
-            
+        # An explicit session ID that isn't in this folder: look in every project,
+        # so resuming a session started elsewhere is still guarded.
+        base = home or Path.home()
+        global_matches = []
+        if agent in ("auto", "claude"):
+            claude_projects = base / ".claude" / "projects"
+            if claude_projects.exists():
+                global_matches += [(f, "claude", f.stat().st_mtime) for f in claude_projects.glob(f"**/*{query_clean}*.jsonl")]
+        if agent in ("auto", "codex"):
+            codex_dir = base / ".codex" / "sessions"
+            if codex_dir.exists():
+                global_matches += [(f, "codex", f.stat().st_mtime) for f in codex_dir.glob(f"**/*{query_clean}*.jsonl")]
+        if global_matches:
+            best = max(global_matches, key=lambda c: c[2])
+            return best[0], best[1]
+        return None, None
+
+    if not candidates:
+        return None, None
+
     best = max(candidates, key=lambda c: c[2])
     return best[0], best[1]
 
 def inspect_claude_session(session_file):
     last_event_time = session_file.stat().st_mtime
-    idle_seconds = time.time() - last_event_time
+    latest_ts = None
     active_tokens = 0
     message_count = 0
     session_title = ""
@@ -138,6 +190,9 @@ def inspect_claude_session(session_file):
                 try:
                     data = json.loads(line)
                     message_count += 1
+                    t_epoch = parse_iso_timestamp(data.get("timestamp"))
+                    if t_epoch:
+                        latest_ts = t_epoch
                     
                     if "aiTitle" in data and not session_title:
                         session_title = data["aiTitle"]
@@ -166,6 +221,11 @@ def inspect_claude_session(session_file):
     except Exception:
         pass
     
+    # Idle time from the last message's own timestamp; file times change when files are copied or synced.
+    if latest_ts:
+        last_event_time = latest_ts
+    idle_seconds = max(0, time.time() - last_event_time)
+
     if active_tokens == 0:
         active_tokens = min(int(session_file.stat().st_size / 4.0), 200000)
         
@@ -183,7 +243,7 @@ def inspect_claude_session(session_file):
 
 def inspect_codex_session(session_file):
     last_event_time = session_file.stat().st_mtime
-    idle_seconds = time.time() - last_event_time
+    latest_ts = None
     active_tokens = 0
     message_count = 0
     session_id = None
@@ -197,6 +257,9 @@ def inspect_codex_session(session_file):
                 try:
                     data = json.loads(line)
                     message_count += 1
+                    t_epoch = parse_iso_timestamp(data.get("timestamp"))
+                    if t_epoch:
+                        latest_ts = t_epoch
                     t = data.get("type", "")
                     
                     if t == "session_meta":
@@ -238,6 +301,11 @@ def inspect_codex_session(session_file):
                 break
         if not session_id:
             session_id = session_file.stem[:8]
+
+    # Idle time from the last message's own timestamp; file times change when files are copied or synced.
+    if latest_ts:
+        last_event_time = latest_ts
+    idle_seconds = max(0, time.time() - last_event_time)
 
     if active_tokens == 0:
         active_tokens = min(int(session_file.stat().st_size / 4.0), 100000)
@@ -467,6 +535,8 @@ def clipboard_commands(platform=None, environ=None, which=None, wsl=None):
         commands.append((["wl-copy"], "utf-8"))
     if which("xclip"):
         commands.append((["xclip", "-selection", "clipboard"], "utf-8"))
+    if which("xsel"):
+        commands.append((["xsel", "-b", "-i"], "utf-8"))
     return commands
 
 def copy_to_clipboard(text, commands=None, popen=None):
@@ -491,7 +561,7 @@ def generate_handoff_prompt(project_name, meta):
     last_commit = ""
     try:
         import subprocess
-        status = subprocess.check_output(["git", "status", "-s"], text=True, stderr=subprocess.DEVNULL)
+        status = subprocess.check_output(["git", "status", "-s"], text=True, stderr=subprocess.DEVNULL, timeout=2)
         for line in status.strip().split("\n"):
             if line.strip():
                 parts = line.strip().split(maxsplit=1)
@@ -502,7 +572,7 @@ def generate_handoff_prompt(project_name, meta):
 
     try:
         import subprocess
-        last_commit = subprocess.check_output(["git", "log", "-1", "--oneline"], text=True, stderr=subprocess.DEVNULL).strip()
+        last_commit = subprocess.check_output(["git", "log", "-1", "--oneline"], text=True, stderr=subprocess.DEVNULL, timeout=2).strip()
     except Exception:
         pass
 
@@ -648,59 +718,96 @@ Options:
     agent = default_agent
     ttl_override = None
     check_only = "--check-only" in sys.argv
+    is_resume = False
+    explicit_agent = False
 
+    forward_args = []
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
-        if arg in ("--agent", "-a") and i + 1 < len(sys.argv):
-            agent = sys.argv[i + 1]
-            i += 2
-            continue
-        elif arg.startswith("--agent="):
-            agent = arg.split("=", 1)[1]
+        if arg in GUARD_FLAGS:
             i += 1
             continue
-        elif arg == "--ttl" and i + 1 < len(sys.argv):
-            try:
-                ttl_override = int(sys.argv[i + 1])
-            except ValueError:
-                pass
-            i += 2
+        if arg == "--ttl":
+            if i + 1 < len(sys.argv):
+                try:
+                    ttl_override = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+                continue
+            i += 1
             continue
-        elif arg.startswith("--ttl="):
+        if arg.startswith("--ttl="):
             try:
                 ttl_override = int(arg.split("=", 1)[1])
             except ValueError:
                 pass
             i += 1
             continue
-        elif arg in ("--resume", "-r") and i + 1 < len(sys.argv):
-            session_query = sys.argv[i + 1]
-            i += 2
+        if arg in ("--agent", "-a"):
+            if i + 1 < len(sys.argv):
+                agent = sys.argv[i + 1]
+                explicit_agent = True
+                i += 2
+                continue
+            i += 1
             continue
-        elif arg.startswith("--resume="):
+        if arg.startswith("--agent="):
+            agent = arg.split("=", 1)[1]
+            explicit_agent = True
+            i += 1
+            continue
+        if arg in ("--resume", "-r"):
+            is_resume = True
+            forward_args.append(arg)
+            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                session_query = sys.argv[i + 1]
+                forward_args.append(session_query)
+                i += 2
+                continue
+            i += 1
+            continue
+        if arg.startswith("--resume="):
+            is_resume = True
             session_query = arg.split("=", 1)[1]
+            forward_args.append(arg)
             i += 1
             continue
-        elif arg == "resume" and i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
-            session_query = sys.argv[i + 1]
-            if agent == "auto":
-                agent = "codex"
-            i += 2
-            continue
-        elif arg == "resume" and (i + 1 == len(sys.argv) or sys.argv[i + 1].startswith("-")):
-            # `codex resume` or `codex resume --last`
-            if agent == "auto":
-                agent = "codex"
+        if arg == "--continue" or (arg == "-c" and agent != "codex"):  # codex -c sets config
+            is_resume = True
+            forward_args.append(arg)
             i += 1
             continue
-        elif not arg.startswith("-") and len(arg) >= 6 and not session_query:
+        if arg == "resume":
+            is_resume = True
+            forward_args.append(arg)
+            if agent == "auto":
+                agent = "codex"
+            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                session_query = sys.argv[i + 1]
+                forward_args.append(session_query)
+                i += 2
+                continue
+            i += 1
+            continue
+        if not arg.startswith("-") and not session_query and SESSION_ID.match(arg):
+            # A bare session ID (`cold-resume-guard e539a748`) means "guard, then resume this one".
             session_query = arg
+            is_resume = True
             i += 1
             continue
+        forward_args.append(arg)
         i += 1
 
-    forward_args = extract_forward_args(sys.argv[1:])
+    # Run directly (`cold-resume-guard`, `claude-guard`) rather than through a shell wrapper:
+    # guard the latest session in this folder.
+    if not explicit_agent and not is_resume and not check_only:
+        is_resume = True
+
+    # A fresh `claude` / `codex` doesn't reload old context, so there's no cold-cache penalty to warn about.
+    if not is_resume and not check_only:
+        launch_agent("codex" if agent == "codex" else "claude", forward_args)
 
     session_file, agent_type = find_session(session_query=session_query, agent=agent)
     if not session_file:

@@ -145,6 +145,8 @@ function codex { cold-resume-guard --agent codex @args }
 ```
 Windows PowerShell (5.1) blocks profile scripts by default; PowerShell 7 allows them. Each keeps its own setting, so `--setup` names the edition that blocks them and prints the one command that allows them for your account, e.g. `powershell -NoProfile -Command "Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"`. It never changes the policy itself.
 
+With the wrappers in place, a plain `claude` or `codex` starts a fresh session straight away (a new session reloads nothing, so there's no cold-cache cost). Resume commands are guarded: `claude --resume [id]`, `claude --continue`, `codex resume [id]`, or a bare session ID.
+
 To undo the setup on any platform: `cold-resume-guard --remove`.
 
 ### Option B: Manual Setup
